@@ -1,0 +1,352 @@
+// =================================================================
+// The "Research Strategist" Orchestrator v9.5 (Batch Processing Fix)
+// Implements guaranteed discovery with batched parallel verification to avoid platform limits.
+// The orchestrator now handles the heavy lifting of fetching and chunking content efficiently.
+// REQUIRES: WORKER_URL, SERPAPI_KEYS, BOT_MEMORY, GEMINI_API_KEYS, EXPLORER, VERIFIER
+// =================================================================
+
+/**
+ * A reusable helper function that implements a per-key fallback sequence.
+ * For each key provided, it tries the primary model, then the fallback model.
+ * @param {string} prompt The prompt to send to the Gemini API.
+ * @param {object} env The worker's environment variables.
+ * @returns {Promise<object>} The JSON response from the successful Gemini API call.
+ */
+async function callGeminiWithFallback(prompt, env) {
+  const primaryModel = "gemini-2.5-pro";
+  const secondaryModel = "gemini-2.0-flash";
+
+  const keys = (env.GEMINI_API_KEYS || "").split(',').map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) {
+    throw new Error("GEMINI_API_KEYS environment variable is not set or contains no keys.");
+  }
+
+  // Shuffle keys to distribute load and not hammer a single invalid key first every time.
+  const shuffledKeys = keys.sort(() => 0.5 - Math.random());
+
+  for (const key of shuffledKeys) {
+    // Try primary and then secondary model for each key
+    for (const model of [primaryModel, secondaryModel]) {
+        try {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+            });
+            if (res.ok) {
+                const result = await res.json();
+                if (result.candidates && result.candidates.length > 0) {
+                    return result;
+                }
+            }
+        } catch (e) {
+            // Ignore exceptions and try the next model/key
+        }
+    }
+  }
+
+  throw new Error("All provided API keys failed on both primary and fallback models.");
+}
+
+
+/**
+ * Immediately save verified job page to KV to prevent data loss
+ * @param {object} env Environment variables
+ * @param {string} newJobPageUrl New verified job page URL
+ */
+async function saveVerifiedPageImmediately(env, newJobPageUrl) {
+  try {
+    const currentPages = JSON.parse(await env.BOT_MEMORY.get("VERIFIED_JOB_PAGES") || '[]');
+    if (!currentPages.includes(newJobPageUrl)) {
+      currentPages.push(newJobPageUrl);
+      await env.BOT_MEMORY.put("VERIFIED_JOB_PAGES", JSON.stringify(currentPages));
+      console.log(`✅ IMMEDIATELY SAVED: ${newJobPageUrl} to KV storage`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error(`❌ Failed to immediately save verified page: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Creativity Engine - Generates search queries based on creativity level and performance history
+ * @param {number} creativityLevel Current creativity level (1-5)
+ * @param {array} successfulPatterns Historical successful search patterns
+ * @param {array} failedPatterns Recently failed search patterns
+ * @returns {string} Base prompt for search query generation
+ */
+function generateCreativePrompt(creativityLevel, successfulPatterns, failedPatterns) {
+  const baseContext = "You are an AI market research specialist focused on discovering Indian IT, data science, and AI job opportunities.";
+  let creativityInstruction = "";
+  let avoidanceInstruction = failedPatterns.length > 0 ? `\n\nCRITICAL: Avoid these recently failed approaches: ${JSON.stringify(failedPatterns.slice(-15))}` : "";
+  let successInstruction = successfulPatterns.length > 0 ? `\n\nINSPIRATION: These approaches worked well previously: ${JSON.stringify(successfulPatterns.slice(-10))}` : "";
+
+  switch (creativityLevel) {
+    case 1: creativityInstruction = `Generate 3 Google search queries to find Indian IT company career pages and established job portals. Focus on software development, data science, and AI roles.`; break;
+    case 2: creativityInstruction = `Generate 3 Google search queries with slight variations of proven approaches. Mix established job portals with company-specific searches for Indian IT, data, and AI roles.`; break;
+    case 3: creativityInstruction = `Think creatively! Generate 3 Google search queries that explore cross-domain opportunities - like fintech companies needing ML engineers, edtech startups hiring data scientists, or logistics companies building AI teams.`; break;
+    case 4: creativityInstruction = `Be innovative! Generate 3 completely novel Google search queries. Think about unexplored angles: government tech initiatives, research institution collaborations, or emerging tech hubs in tier-2 Indian cities.`; break;
+    case 5: creativityInstruction = `MAXIMUM CREATIVITY MODE! Generate 3 wildly different, contrarian Google search queries. Think outside conventional wisdom - maybe Indian subsidiaries of global companies, stealth mode startups, or unconventional hiring channels for tech roles.`; break;
+    default: creativityInstruction = `Generate 3 precise Google search queries to find Indian IT job opportunities.`;
+  }
+  return `${baseContext} ${creativityInstruction}${successInstruction}${avoidanceInstruction}`;
+}
+
+/**
+ * Performance Analytics - Analyzes and learns from discovery patterns
+ * @param {object} analytics Current analytics data
+ * @param {string} query The search query used
+ * @param {boolean} foundNewPage Whether this query led to new page discovery
+ * @returns {object} Updated analytics
+ */
+function updatePerformanceAnalytics(analytics, query, foundNewPage) {
+  if (!analytics.queryPatterns) analytics.queryPatterns = [];
+  if (!analytics.successfulPatterns) analytics.successfulPatterns = [];
+  if (!analytics.failedPatterns) analytics.failedPatterns = [];
+
+  analytics.queryPatterns.push({ query: query, timestamp: new Date().toISOString(), success: foundNewPage });
+  if (foundNewPage) {
+    analytics.successfulPatterns.push(query);
+  } else {
+    analytics.failedPatterns.push(query);
+  }
+
+  if (analytics.successfulPatterns.length > 20) analytics.successfulPatterns.shift();
+  if (analytics.failedPatterns.length > 30) analytics.failedPatterns.shift();
+  if (analytics.queryPatterns.length > 100) analytics.queryPatterns.shift();
+
+  return analytics;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === '/__continue') {
+      if (request.headers.get('X-Internal-Trigger') !== env.INTERNAL_TRIGGER_SECRET) return new Response("Forbidden", { status: 403 });
+      const { nextCycle } = await request.json();
+      ctx.waitUntil(this.runStrategicOrchestration(env, ctx, nextCycle));
+      return new Response(`Cycle ${nextCycle} initiated.`);
+    }
+    if (url.pathname === '/__scheduled') {
+        ctx.waitUntil(this.scheduled(null, env, ctx));
+        return new Response("Strategic task execution started.");
+    }
+    return new Response("This worker is a strategist.", { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    console.log("Strategist waking up due to schedule. Starting hunt from cycle 1.");
+    ctx.waitUntil(this.runStrategicOrchestration(env, ctx, 1));
+  },
+
+  async runStrategicOrchestration(env, ctx, cycle) {
+    if (!env.WORKER_URL || !env.SERPAPI_KEYS || !env.GEMINI_API_KEYS || !env.EXPLORER || !env.VERIFIER) {
+      console.error("CRITICAL ERROR: Core environment variables not set.");
+      return;
+    }
+
+    const defaultSeedLibrary = '{"https://inc42.com/features/":{"score":1,"last_visited":"2000-01-01T00:00:00Z"}}';
+    const defaultAnalytics = '{"queryPatterns":[],"successfulPatterns":[],"failedPatterns":[],"consecutiveFailures":0}';
+
+    console.log(`\n--- Hunter Cycle ${cycle} (Centralized) ---`);
+
+    try {
+        let seedLibrary = JSON.parse(await env.BOT_MEMORY.get("SEED_LIBRARY") || defaultSeedLibrary);
+        let processedCompanies = JSON.parse(await env.BOT_MEMORY.get("PROCESSED_COMPANIES") || '{}');
+        let verifiedJobPages = JSON.parse(await env.BOT_MEMORY.get("VERIFIED_JOB_PAGES") || '[]');
+        let promptHistory = JSON.parse(await env.BOT_MEMORY.get("PROMPT_HISTORY") || '[]');
+        let performanceAnalytics = JSON.parse(await env.BOT_MEMORY.get("PERFORMANCE_ANALYTICS") || defaultAnalytics);
+
+        const initialVerifiedCount = verifiedJobPages.length;
+
+        const creativityLevel = Math.min(5, Math.floor(performanceAnalytics.consecutiveFailures / 5) + 1);
+        console.log(`Creativity Level: ${creativityLevel}/5 (${performanceAnalytics.consecutiveFailures} consecutive failures)`);
+
+        const twentyThreeHoursAgo = new Date(Date.now() - 23 * 60 * 60 * 1000);
+        const eligibleSources = Object.entries(seedLibrary).filter(([_, data]) => new Date(data.last_visited) < twentyThreeHoursAgo);
+
+        if (eligibleSources.length > 0) {
+            console.log("Mode: EXPLORING.");
+            eligibleSources.sort(([, a], [, b]) => b.score - a.score);
+            const [sourceToExplore, sourceData] = eligibleSources[0];
+            console.log(`Target: ${sourceToExplore} (Score: ${sourceData.score})`);
+            seedLibrary[sourceToExplore].last_visited = new Date().toISOString();
+
+            const sourceResponse = await fetch(sourceToExplore, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' } });
+            let companyLeads = [];
+
+            if (sourceResponse.ok) {
+                // =========== START: BATCHING FIX ===========
+                const textChunks = [];
+                const GEMINI_PROMPT_LIMIT = 28000;
+                let currentBuffer = '';
+
+                const rewriter = new HTMLRewriter().on('*', { text(chunk) {
+                    currentBuffer += chunk.text;
+                    if (currentBuffer.length >= GEMINI_PROMPT_LIMIT) {
+                        if (currentBuffer.trim()) textChunks.push(currentBuffer);
+                        currentBuffer = '';
+                    }
+                }});
+
+                await rewriter.transform(sourceResponse).text();
+                if (currentBuffer.length > 0 && currentBuffer.trim()) textChunks.push(currentBuffer);
+
+                const BATCH_SIZE = 5; // A safe batch size to avoid CPU and subrequest limits
+                let allCompanies = [];
+                console.log(`Processing ${textChunks.length} text chunks in batches of ${BATCH_SIZE}...`);
+
+                for (let i = 0; i < textChunks.length; i += BATCH_SIZE) {
+                    const batch = textChunks.slice(i, i + BATCH_SIZE);
+                    const batchPromises = batch.map(textChunk =>
+                        env.EXPLORER.fetch(new Request('http://localhost/', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ text_chunk: textChunk })
+                        }))
+                        .then(res => res.ok ? res.json() : [])
+                        .catch(e => {
+                            console.error("Explorer sub-request failed in batch:", e.message);
+                            return []; // Return empty array on failure to not crash the whole batch
+                        })
+                    );
+
+                    const batchResults = await Promise.all(batchPromises);
+                    allCompanies.push(...batchResults.flat()); // .flat() because explorer returns an array
+                    console.log(`Completed batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(textChunks.length / BATCH_SIZE)}. Companies found so far: ${allCompanies.length}`);
+                }
+                // =========== END: BATCHING FIX ===========
+
+                const companyMap = new Map();
+                allCompanies.forEach(company => {
+                    if(company.company_name) companyMap.set(company.company_name.toLowerCase(), company);
+                });
+                companyLeads = Array.from(companyMap.values());
+            } else {
+                console.warn(`Failed to fetch source URL: ${sourceToExplore} with status ${sourceResponse.status}`);
+            }
+
+            const allNewLeads = companyLeads.filter(c => c.company_name && !processedCompanies[c.company_name.toLowerCase()]);
+            console.log(`Explorer found ${allNewLeads.length} new leads.`);
+
+            const sourceScore = sourceData.score;
+            const maxCompaniesToProcess = sourceScore > 5 ? 12 : (sourceScore > 2 ? 8 : 6);
+            const leadsToProcess = allNewLeads.slice(0, maxCompaniesToProcess);
+
+            if (leadsToProcess.length > 0) {
+                console.log(`🚀 Starting parallel verification & save for ${leadsToProcess.length} companies...`);
+
+                const processingPromises = leadsToProcess.map(company => {
+                    processedCompanies[company.company_name.toLowerCase()] = new Date().toISOString();
+
+                    return env.VERIFIER.fetch(new Request('http://localhost/', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ company_name: company.company_name })
+                    }))
+                    .then(res => res.ok ? res.json() : { newPageFound: false })
+                    .then(async (verifierData) => {
+                        if (verifierData.is_careers_page && verifierData.confidence_score > 0.8 && !verifiedJobPages.includes(verifierData.final_url)) {
+                            if (await saveVerifiedPageImmediately(env, verifierData.final_url)) {
+                                console.log(`🎯 SUCCESS (saved instantly): ${verifierData.final_url}`);
+                                return { newPageFound: true, url: verifierData.final_url };
+                            }
+                        }
+                        return { newPageFound: false };
+                    })
+                    .catch(err => {
+                        console.warn(`Verification failed for ${company.company_name}: ${err.message}`);
+                        return { newPageFound: false };
+                    });
+                });
+
+                const processingResults = await Promise.allSettled(processingPromises);
+
+                let newDiscoveriesInBatch = 0;
+                for (const result of processingResults) {
+                    if (result.status === 'fulfilled' && result.value.newPageFound) {
+                        newDiscoveriesInBatch++;
+                        verifiedJobPages.push(result.value.url);
+                    }
+                }
+                console.log(`✅ All parallel tasks complete. ${newDiscoveriesInBatch} new page(s) were found and saved.`);
+            }
+
+            const newDiscoveries = verifiedJobPages.length - initialVerifiedCount;
+            if (newDiscoveries > 0) {
+                seedLibrary[sourceToExplore].score += newDiscoveries;
+                console.log(`Source rewarded. New score: ${seedLibrary[sourceToExplore].score}`);
+                performanceAnalytics = updatePerformanceAnalytics(performanceAnalytics, `explore:${sourceToExplore}`, true);
+                performanceAnalytics.consecutiveFailures = 0;
+            } else {
+                seedLibrary[sourceToExplore].score = Math.max(-5, (seedLibrary[sourceToExplore].score || 1) - 1);
+                console.log(`Source penalized. New score: ${seedLibrary[sourceToExplore].score}`);
+                performanceAnalytics.consecutiveFailures++;
+            }
+            if (seedLibrary[sourceToExplore].score < -5) { console.log(`Pruning low-value source: ${sourceToExplore}`); delete seedLibrary[sourceToExplore]; }
+        } else {
+            console.log("Mode: DISCOVERY.");
+            const basePrompt = generateCreativePrompt(
+                creativityLevel,
+                performanceAnalytics.successfulPatterns,
+                performanceAnalytics.failedPatterns
+            );
+
+            const discoveryPrompt = `Your response MUST be a single, valid JSON array of strings. Here is your task:\n${basePrompt}`;
+            const geminiData = await callGeminiWithFallback(discoveryPrompt, env);
+            const jsonString = geminiData.candidates[0].content.parts[0].text.replaceAll('```json', '').replaceAll('```', '').trim();
+            const searchQueries = JSON.parse(jsonString);
+
+            const query = searchQueries[Math.floor(Math.random() * searchQueries.length)];
+            promptHistory.push(query); if (promptHistory.length > 20) promptHistory.shift();
+            console.log(`Googling with Creativity Level ${creativityLevel}: "${query}"`);
+
+            const apiKeys = env.SERPAPI_KEYS.split(',').map(k => k.trim()).filter(Boolean);
+            const shuffledKeys = apiKeys.sort(() => 0.5 - Math.random());
+            let searchResults = null;
+            for (const apiKey of shuffledKeys) {
+                const searchRes = await fetch(`https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${apiKey}&google_domain=google.co.in&gl=in`);
+                if (searchRes.ok) { const data = await searchRes.json(); if (!data.error) { searchResults = data; break; } }
+            }
+
+            if (searchResults && searchResults.organic_results && searchResults.organic_results.length > 0) {
+                const newSeedUrl = searchResults.organic_results[0].link;
+                if (!seedLibrary[newSeedUrl]) {
+                    console.log(`Found a promising new source: ${newSeedUrl}.`);
+                    seedLibrary[newSeedUrl] = { score: 1, last_visited: "2000-01-01T00:00:00Z" };
+                    performanceAnalytics = updatePerformanceAnalytics(performanceAnalytics, query, true);
+                } else {
+                    performanceAnalytics.consecutiveFailures++;
+                }
+            } else {
+                console.log("DISCOVERY search yielded no organic results.");
+                performanceAnalytics = updatePerformanceAnalytics(performanceAnalytics, query, false);
+                performanceAnalytics.consecutiveFailures++;
+            }
+        }
+
+        await env.BOT_MEMORY.put("SEED_LIBRARY", JSON.stringify(seedLibrary));
+        await env.BOT_MEMORY.put("PROCESSED_COMPANIES", JSON.stringify(processedCompanies));
+        await env.BOT_MEMORY.put("PROMPT_HISTORY", JSON.stringify(promptHistory));
+        await env.BOT_MEMORY.put("PERFORMANCE_ANALYTICS", JSON.stringify(performanceAnalytics));
+
+        if (verifiedJobPages.length > initialVerifiedCount) {
+            console.log(`🎉 MISSION ACCOMPLISHED! Found ${verifiedJobPages.length - initialVerifiedCount} new page(s). Resetting failure counter and halting chain.`);
+            performanceAnalytics.consecutiveFailures = 0;
+            await env.BOT_MEMORY.put("PERFORMANCE_ANALYTICS", JSON.stringify(performanceAnalytics));
+        } else {
+            console.log(`No new page found in cycle ${cycle}. Triggering next cycle...`);
+            ctx.waitUntil(fetch(new URL("/__continue", env.WORKER_URL).toString(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Trigger': env.INTERNAL_TRIGGER_SECRET }, body: JSON.stringify({ nextCycle: cycle + 1 }) }));
+        }
+    } catch (e) {
+      console.error(`CRITICAL FAILURE IN CYCLE ${cycle}: ${e.message}\n${e.stack}`);
+      const currentAnalytics = JSON.parse(await env.BOT_MEMORY.get("PERFORMANCE_ANALYTICS") || defaultAnalytics);
+      currentAnalytics.consecutiveFailures = (currentAnalytics.consecutiveFailures || 0) + 1;
+      await env.BOT_MEMORY.put("PERFORMANCE_ANALYTICS", JSON.stringify(currentAnalytics));
+
+      setTimeout(() => {
+        ctx.waitUntil(fetch(new URL("/__continue", env.WORKER_URL).toString(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Trigger': env.INTERNAL_TRIGGER_SECRET }, body: JSON.stringify({ nextCycle: cycle + 1 }) }));
+      }, 5000);
+    }
+  }
+};
