@@ -1,0 +1,146 @@
+
+// Enhanced Verifier (v9.0 - IT Role Detection with Smart Analysis)
+
+/**
+ * A reusable helper function that implements a per-key fallback sequence.
+ * For each key provided, it tries the primary model, then the fallback model.
+ * @param {string} prompt The prompt to send to the Gemini API.
+ * @param {object} env The worker's environment variables.
+ * @returns {Promise<object>} The JSON response from the successful Gemini API call.
+ */
+async function callGeminiWithFallback(prompt, env) {
+  const primaryModel = "gemini-2.5-pro";
+  const secondaryModel = "gemini-2.0-flash";
+
+  const keys = (env.GEMINI_API_KEYS || "").split(',').map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) {
+    throw new Error("GEMINI_API_KEYS environment variable is not set or contains no keys.");
+  }
+
+  const shuffledKeys = keys.sort(() => 0.5 - Math.random());
+
+  for (const key of shuffledKeys) {
+    try {
+      console.log(`Attempting primary model (${primaryModel}) with a key.`);
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${primaryModel}:generateContent?key=${key}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+      if (res.ok) {
+        const result = await res.json();
+        if (result.candidates && result.candidates.length > 0) {
+          console.log(`Success with primary model: ${primaryModel}`);
+          return result;
+        }
+      }
+      console.warn(`Primary model failed with status: ${res.status}. Trying fallback.`);
+    } catch (e) {
+      console.warn(`An exception occurred with primary model: ${e.message}. Trying fallback.`);
+    }
+
+    try {
+      console.log(`Attempting fallback model (${secondaryModel}) with the same key.`);
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${secondaryModel}:generateContent?key=${key}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+      if (res.ok) {
+        const result = await res.json();
+        if (result.candidates && result.candidates.length > 0) {
+          console.log(`Success with fallback model: ${secondaryModel}`);
+          return result;
+        }
+      }
+      console.warn(`Fallback model also failed for this key. Trying next key.`);
+    } catch (e) {
+      console.warn(`An exception occurred with fallback model: ${e.message}. Trying next key.`);
+    }
+  }
+
+  throw new Error("All provided API keys failed on both primary and fallback models.");
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method !== 'POST') {
+      return new Response('Verifier accepts POST only', { status: 405 });
+    }
+
+    try {
+      const { company_name } = await request.json();
+      if (!company_name) {
+        return new Response('Missing company_name.', { status: 400 });
+      }
+
+      console.log(`VERIFIER: Received company: "${company_name}"`);
+
+      // Enhanced predictor prompt for IT-focused career page discovery
+      const predictorPrompt = `You are an expert system that predicts careers page URLs for Indian IT, data science, and AI companies. 
+
+Company Name: "${company_name}"
+
+Consider these patterns for Indian companies:
+- Standard: /careers, /jobs, /career, /join-us, /life-at-[company]
+- IT-specific: /engineering-jobs, /tech-careers, /developer-jobs
+- Common domains: .com, .in, .co.in
+- Startup patterns: [company].com/careers, careers.[company].com
+
+Your response MUST be a single, valid JSON object in the format: {"predicted_url": "string"}.`;
+
+      const predictionResult = await callGeminiWithFallback(predictorPrompt, env);
+      const jsonStringPred = predictionResult.candidates[0].content.parts[0].text.replaceAll('```json', '').replaceAll('```', '').trim();
+      const { predicted_url: careers_url } = JSON.parse(jsonStringPred);
+
+      if (!careers_url) {
+        console.log(`VERIFIER: Could not predict a URL for "${company_name}".`);
+        return new Response(JSON.stringify({ is_careers_page: false, reason: "Could not predict a careers URL." }), { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      console.log(`VERIFIER: Predicted URL for "${company_name}" is: ${careers_url}`);
+
+      const siteResponse = await fetch(careers_url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' } });
+      if (!siteResponse.ok) {
+        console.log(`VERIFIER: Predicted URL for "${company_name}" was invalid. Status: ${siteResponse.status}`);
+        return new Response(JSON.stringify({ is_careers_page: false, reason: `Predicted URL invalid. Status: ${siteResponse.status}` }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      const pageText = await siteResponse.text();
+
+      // Enhanced verification prompt specifically for Indian IT roles
+      const verificationPrompt = `You are a recruitment analyst specializing in Indian IT, data science, and AI roles. Analyze the provided webpage text to determine if it contains legitimate job opportunities in these areas.
+
+Look for these POSITIVE indicators:
+- IT roles: Software Developer, Full Stack Developer, Backend Engineer, Frontend Engineer, DevOps Engineer
+- Data roles: Data Scientist, Data Analyst, Machine Learning Engineer, AI Engineer
+- Technical skills: Python, Java, JavaScript, React, Node.js, AWS, Azure, SQL, MongoDB
+- Indian context: Bangalore, Mumbai, Delhi, Gurgaon, Hyderabad, Pune, Chennai locations
+- Legitimate details: Salary ranges (LPA), experience requirements, proper job descriptions
+- Company verification: Established company domains, professional job descriptions
+
+Look for these NEGATIVE indicators:
+- Vague descriptions without specific technical requirements
+- "Work from home" schemes without proper company backing
+- Unrealistic salary promises for entry-level roles
+- Requests for upfront payments or fees
+- Missing company information or contact details
+
+Your response MUST be a single, valid JSON object in the format: 
+{ "is_careers_page": boolean, "confidence_score": float, "final_url": "${careers_url}" }
+
+Webpage text: """${pageText.substring(0, 30000)}"""`;
+
+      const verificationResult = await callGeminiWithFallback(verificationPrompt, env);
+      const jsonStringVer = verificationResult.candidates[0].content.parts[0].text.replaceAll('```json', '').replaceAll('```', '').trim();
+      
+      const finalData = JSON.parse(jsonStringVer);
+      console.log(`VERIFIER: Result for "${company_name}": is_page=${finalData.is_careers_page}, score=${finalData.confidence_score}, url=${finalData.final_url}`);
+
+      return new Response(JSON.stringify(finalData), { headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+      console.error(`A critical error occurred in the verifier: ${error.message}\n${error.stack}`);
+      return new Response(JSON.stringify({
+        is_careers_page: false,
+        confidence_score: 0,
+        reason: `A critical exception occurred: ${error.message}`
+      }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  },
+};
