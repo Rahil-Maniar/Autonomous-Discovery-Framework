@@ -1,7 +1,5 @@
 # Autonomous Discovery Framework (ADF)
 
-**[💡 Optional but Recommended: Link to a 2-Minute Video Demo Here]**
-
 This project is an autonomous, multi-agent AI system built on a serverless cloud platform. It automates the entire pipeline of market intelligence gathering, from discovering new web sources to validating their contents for specific business criteria.
 
 ---
