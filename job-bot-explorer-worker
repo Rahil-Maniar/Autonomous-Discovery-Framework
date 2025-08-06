@@ -1,16 +1,18 @@
 // =================================================================
-// Enhanced Explorer v9.2 (Fixed - Simplified Chunk Processor)
-// This worker is now a simple, fast processor for text chunks.
-// It receives a block of text and returns a list of company names.
-// REQUIRES: GEMINI_API_KEYS
+// Enhanced Explorer v10.1 (Complete)
+//
+// KEY ENHANCEMENTS:
+// - More focused prompt to improve accuracy and speed.
+// - Hardened error handling to ensure it never crashes the orchestrator.
 // =================================================================
 
 /**
  * A reusable helper function that implements a per-key fallback sequence for the Gemini API.
  */
 async function callGeminiWithFallback(prompt, env) {
-  const primaryModel = "gemini-2.5-pro";
-  const secondaryModel = "gemini-2.0-flash";
+  // Using a faster model as default for this high-volume task
+  const primaryModel = "gemini-2.0-flash";
+  const secondaryModel = "gemini-2.5-pro";
   const keys = (env.GEMINI_API_KEYS || "").split(',').map(k => k.trim()).filter(Boolean);
   if (keys.length === 0) throw new Error("GEMINI_API_KEYS environment variable is not set.");
   const shuffledKeys = keys.sort(() => 0.5 - Math.random());
@@ -18,15 +20,16 @@ async function callGeminiWithFallback(prompt, env) {
     for (const model of [primaryModel, secondaryModel]) {
       try {
         const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          signal: AbortSignal.timeout(45000) // 45s timeout, given the long wall times
         });
         if (res.ok) {
           const result = await res.json();
           if (result.candidates && result.candidates.length > 0) return result;
         }
-      } catch (e) {
-        // Ignore exception and try next model/key
-      }
+      } catch (e) { /* Ignore and try next */ }
     }
   }
   throw new Error("All provided API keys failed on both models.");
@@ -40,15 +43,15 @@ export default {
         const { text_chunk } = await request.json();
         if (!text_chunk) return new Response('Missing text_chunk', { status: 400 });
 
-        const geminiPrompt = `You are an AI business intelligence analyst specializing in Indian IT, data science, and AI companies. Your task is to extract company names from the provided article text.
+        const geminiPrompt = `You are an AI data extractor. Your sole task is to extract company names from the provided text.
         
-- Focus on company names ONLY.
-- IGNORE names of people, places, and general terms.
-- Exclude news agencies, media houses, and government bodies unless they are the primary subject as an employer.
+- Focus ONLY on names of companies, startups, or corporate entities.
+- IGNORE names of people, places, technologies, and media houses (e.g., "Forbes", "TechCrunch").
+- The goal is to identify potential employers in the Indian tech sector.
 
-Your response MUST be a single, valid JSON array of objects in the format: [{ "company_name": "string" }]. If no relevant companies are found, return an empty array [].
+Your response MUST be a single, valid JSON array of objects in the format: [{"company_name": "string"}]. If no companies are found, return an empty array [].
 
-Article text: """${text_chunk}"""`;
+Article text: """${text_chunk.substring(0, 25000)}"""`;
 
         const geminiResult = await callGeminiWithFallback(geminiPrompt, env);
         const jsonString = geminiResult.candidates[0].content.parts[0].text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -58,7 +61,7 @@ Article text: """${text_chunk}"""`;
 
     } catch (error) {
         console.error(`A critical error occurred in the explorer: ${error.message}\n${error.stack}`);
-        // Return an empty array in case of a critical failure so the orchestrator doesn't crash
+        // CRITICAL: Return an empty array on failure so the orchestrator doesn't crash.
         return new Response("[]", { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   },
